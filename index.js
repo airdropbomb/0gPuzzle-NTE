@@ -20,6 +20,15 @@ function askQuestion(query) {
   }));
 }
 
+function logToFile(message) {
+  try {
+    const timestamp = new Date().toISOString();
+    fs.appendFileSync('debug.log', `[${timestamp}] ${message}\n`, 'utf8');
+  } catch (err) {
+    console.error(chalk.red(`Failed to write to debug.log: ${err.message}`));
+  }
+}
+
 function centerText(text, color = "cyanBright") {
   const terminalWidth = process.stdout.columns || 80;
   const padding = Math.max(0, Math.floor((terminalWidth - text.length) / 2));
@@ -149,7 +158,6 @@ async function verifyTask(activityId, headers) {
     return false;
   }
 }
-
 async function performCheckIn(activityId, headers) {
   const payload = {
     operationName: "VerifyActivity",
@@ -211,11 +219,71 @@ async function performCheckIn(activityId, headers) {
   };
 
   try {
-    const response = await axiosInstance.post("https://api.deform.cc/", payload, { headers });
+    const response = await requestWithRetry(
+      () => axiosInstance.post("https://api.deform.cc/", payload, { headers }),
+      3,
+      2000
+    );
     return response.data;
   } catch (err) {
     console.error(chalk.red("Error saat check-in:", err.response ? err.response.data : err.message));
     return null;
+  }
+}
+
+
+async function checkCheckInStatus(activityId, headers) {
+  const payload = {
+    operationName: "Campaign",
+    variables: { campaignId: "f7e24f14-b911-4f11-b903-edac89a095ec" },
+    query: `
+      fragment ActivityFields on CampaignActivity {
+        id
+        title
+        createdAt
+        records {
+          id
+          status
+          createdAt
+          __typename
+        }
+        __typename
+      }
+      query Campaign($campaignId: String!) {
+        campaign(id: $campaignId) {
+          activities {
+            ...ActivityFields
+            __typename
+          }
+          __typename
+        }
+      }`
+  };
+
+  try {
+    const response = await axiosInstance.post("https://api.deform.cc/", payload, { headers });
+    const campaignData = response.data.data.campaign;
+    const dailyCheckin = campaignData.activities.find(act =>
+      act.title && act.title.toLowerCase().includes("daily check-in") && act.id === activityId
+    );
+
+    if (dailyCheckin && dailyCheckin.records && dailyCheckin.records.length > 0) {
+      const sortedRecords = dailyCheckin.records.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      const latestRecord = sortedRecords[0];
+      const recordDate = new Date(latestRecord.createdAt);
+      const today = new Date();
+      const isToday = recordDate.getUTCFullYear() === today.getUTCFullYear() &&
+                      recordDate.getUTCMonth() === today.getUTCMonth() &&
+                      recordDate.getUTCDate() === today.getUTCDate();
+      if (isToday && ["COMPLETED", "VERIFIED"].includes(latestRecord.status.toUpperCase())) {
+        return "Already check-in today";
+      }
+      return "Belum Check-in";
+    }
+    return "Belum Check-in";
+  } catch (err) {
+    console.error(chalk.red("Error saat memeriksa status check-in:", err.response ? err.response.data : err.message));
+    return "Error";
   }
 }
 
@@ -224,7 +292,6 @@ async function doLogin(walletKey, debug = false) {
     return await requestWithRetry(async () => {
       const wallet = new Wallet(walletKey);
       const address = wallet.address;
-      if (debug) console.log(chalk.blue("Wallet address:", address));
 
       const privyHeaders = {
         "Host": "auth.privy.io",
@@ -287,7 +354,7 @@ Resources:
 
       return { userLoginToken, displayName, wallet, address, loginTime: Date.now() };
     }, 30, 2000, debug);
-  perspective} catch (err) {
+  } catch (err) {
     console.error(chalk.red(`Login gagal untuk akun ${shortAddress((new Wallet(walletKey)).address)}: ${err.message}`));
     return null;
   }
@@ -391,28 +458,52 @@ async function runCycleOnce(walletKey) {
 
   let checkinStatus = "Belum Check-in";
   if (dailyCheckin) {
-    if (!dailyCheckin.records || dailyCheckin.records.length === 0) {
+    checkinStatus = await checkCheckInStatus(dailyCheckin.id, campaignHeaders);
+    console.log(chalk.yellow(`Status Check-in dari Server: ${checkinStatus}`));
+    if (checkinStatus === "Belum Check-in") {
       const spinnerCheckin = ora(chalk.cyan(`Melakukan check-in untuk: ${dailyCheckin.title}`)).start();
-      const checkInResponse = await performCheckIn(dailyCheckin.id, campaignHeaders);
-      spinnerCheckin.stop();
-      if (
-        checkInResponse &&
-        checkInResponse.data &&
-        checkInResponse.data.verifyActivity &&
-        checkInResponse.data.verifyActivity.record &&
-        checkInResponse.data.verifyActivity.record.status &&
-        checkInResponse.data.verifyActivity.record.status.toUpperCase() === "COMPLETED"
-      ) {
-        checkinStatus = "Check-in Berhasil";
-        dailyCheckin.records = [checkInResponse.data.verifyActivity.record];
-      } else {
-        console.log(chalk.red("Check-in Gagal."));
+      try {
+        const checkInResponse = await performCheckIn(dailyCheckin.id, campaignHeaders);
+        spinnerCheckin.stop();
+        if (!checkInResponse) {
+          checkinStatus = "Check-in Gagal";
+          console.log(chalk.red("Check-in gagal: No response from server."));
+        } else if (
+          checkInResponse?.data?.verifyActivity?.record?.status?.toUpperCase() === "COMPLETED"
+        ) {
+          checkinStatus = "Check-in Berhasil";
+          dailyCheckin.records = [checkInResponse.data.verifyActivity.record];
+          console.log(chalk.green("Check-in berhasil dilakukan."));
+        } else if (
+          checkInResponse?.data?.errors?.some(err => 
+            err.message?.toLowerCase().includes("already checked in") ||
+            err.message?.toLowerCase().includes("already completed") ||
+            err.message?.toLowerCase().includes("already verified")
+          )
+        ) {
+          checkinStatus = "Already check-in today";
+          console.log(chalk.green("Already check-in today."));
+        } else {
+          checkinStatus = "Check-in Gagal";
+          console.log(chalk.red("Check-in gagal, periksa koneksi atau server."));
+        }
+      } catch (err) {
+        spinnerCheckin.stop();
+        checkinStatus = "Check-in Gagal";
+        console.log(chalk.red("Check-in gagal: " + (err.response ? JSON.stringify(err.response.data) : err.message)));
       }
-    } else {
-      checkinStatus = "Selesai";
+    } else if (checkinStatus === "Already check-in today") {
+      console.log(chalk.green("Already check-in today."));
+      checkinStatus = "Already check-in today";
+    } else if (checkinStatus === "Error") {
+      console.log(chalk.red("Gagal memeriksa status check-in, coba lagi nanti."));
+      checkinStatus = "Error";
     }
+  } else {
+    console.log(chalk.red("Aktivitas daily check-in tidak ditemukan."));
+    checkinStatus = "Tidak Tersedia";
   }
-  
+
   console.clear();
   console.log(chalk.magenta('\n==========================================================================='));
   console.log(chalk.blueBright.bold('                         USER INFORMATION'));
@@ -420,7 +511,7 @@ async function runCycleOnce(walletKey) {
   console.log(chalk.cyanBright(`Name          : ${displayName}`));
   console.log(chalk.cyanBright(`Address       : ${shortAddress(address)}`));
   console.log(chalk.cyanBright(`XP            : ${userMePoints}`));
-  console.log(chalk.cyanBright(`Daily Checkin : ${dailyCheckin ? checkinStatus : "Belum Selesai"}`));
+  console.log(chalk.cyanBright(`Daily Checkin : ${checkinStatus}`));
   console.log(chalk.cyanBright(`Proxy         : ${proxyUrl || "Tidak ada"}`));
   console.log(chalk.magenta('============================================================================'));
 
@@ -453,6 +544,7 @@ async function runCycleOnce(walletKey) {
   console.log(chalk.magenta('------------------------------------------------------------------------\n'));
 }
 
+
 async function mainLoopRoundRobin() {
   await setupProxy();
 
@@ -465,7 +557,7 @@ async function mainLoopRoundRobin() {
   while (true) {
     const cycleStart = Date.now();
     for (const key of accounts) {
-      console.log(chalk.cyan(`\nMemproses akun: ${shortAddress((new Wallet(key)).address)}\n`));
+      console.log(chalk.cyan(`Memproses akun: ${shortAddress((new Wallet(key)).address)}\n`));
       try {
         await runCycleOnce(key);
       } catch (err) {
@@ -473,7 +565,7 @@ async function mainLoopRoundRobin() {
       }
       await new Promise(resolve => setTimeout(resolve, 3000));
     }
-    const cycleDuration = 24 * 60 * 60 * 1000;
+    const cycleDuration = 24 * 60 * 60 * 1000 + 4 * 60 * 1000;
     const elapsed = Date.now() - cycleStart;
     const remaining = cycleDuration - elapsed;
     if (remaining > 0) {
