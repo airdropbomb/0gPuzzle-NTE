@@ -1,6 +1,6 @@
 # 0gPuzzle-NTE
 
-## (Register)[https://puzzlemania.0g.ai/?referral=2waGEe38sYns]
+## [Register](https://puzzlemania.0g.ai/?referral=2waGEe38sYns)
 
 1. Clone the repository:
 ```bash
